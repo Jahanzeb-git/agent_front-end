@@ -4,125 +4,139 @@ interface SSEHandlerOptions {
   onEvent: (event: TaskEvent) => void;
   onError: (error: string) => void;
   onClose?: () => void;
+  onConnectionStart?: () => void;
 }
 
 export class SSEHandler {
-  private eventSource: EventSource | null = null;
+  private abortController: AbortController | null = null;
   private options: SSEHandlerOptions;
+  private isConnected: boolean = false;
 
   constructor(options: SSEHandlerOptions) {
     this.options = options;
   }
 
-  public connect(url: string): void {
+  public async connectWithFetch(sessionId: string, query: string): Promise<void> {
     // Close any existing connection
     this.close();
 
+    this.abortController = new AbortController();
+    const { signal } = this.abortController;
+
     try {
-      // Create a new connection
-      this.eventSource = new EventSource(url);
-
-      // Handle incoming messages
-      this.eventSource.onmessage = (event) => {
-        try {
-          // Parse the event data
-          const data = JSON.parse(event.data);
-          this.options.onEvent(data);
-        } catch (error) {
-          console.error('Error parsing SSE event:', error);
-          this.options.onError('Failed to parse streaming data');
-        }
-      };
-
-      // Handle errors
-      this.eventSource.onerror = (error) => {
-        console.error('SSE connection error:', error);
-        this.options.onError('Connection error, please try again');
-        this.close();
-      };
-    } catch (error) {
-      console.error('Failed to establish SSE connection:', error);
-      this.options.onError('Failed to connect to the server');
-    }
-  }
-
-  public close(): void {
-    if (this.eventSource) {
-      this.eventSource.close();
-      this.eventSource = null;
-      
-      if (this.options.onClose) {
-        this.options.onClose();
+      // Notify connection start
+      if (this.options.onConnectionStart) {
+        this.options.onConnectionStart();
       }
-    }
-  }
 
-  public connectWithFetch(sessionId: string, query: string): void {
-    const controller = new AbortController();
-    const { signal } = controller;
+      const response = await fetch('http://localhost:5001/Query', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Accept': 'text/event-stream',
+          'Cache-Control': 'no-cache',
+        },
+        body: JSON.stringify({
+          session_id: sessionId,
+          query: query,
+        }),
+        signal,
+      });
 
-    fetch('http://localhost:5001/Query', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        session_id: sessionId,
-        query: query,
-      }),
-      signal,
-    })
-      .then(response => {
-        if (!response.ok) {
-          throw new Error(`HTTP error! status: ${response.status}`);
-        }
-        
-        const reader = response.body?.getReader();
-        if (!reader) {
-          throw new Error('Response body is not readable');
-        }
-        
-        const decoder = new TextDecoder();
-        let buffer = '';
-        
-        const processStream = () => {
-          reader.read().then(({ done, value }) => {
+      if (!response.ok) {
+        throw new Error(`HTTP error! status: ${response.status}`);
+      }
+
+      if (!response.body) {
+        throw new Error('Response body is not readable');
+      }
+
+      this.isConnected = true;
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+
+      const processStream = async (): Promise<void> => {
+        try {
+          while (this.isConnected) {
+            const { done, value } = await reader.read();
+            
             if (done) {
               if (this.options.onClose) {
                 this.options.onClose();
               }
-              return;
+              break;
             }
-            
+
             buffer += decoder.decode(value, { stream: true });
             
-            // Process each complete "data:" line
+            // Process each complete line
             const lines = buffer.split('\n');
             buffer = lines.pop() || ''; // Keep the last incomplete line in the buffer
             
             for (const line of lines) {
-              if (line.startsWith('data:')) {
+              const trimmedLine = line.trim();
+              if (trimmedLine.startsWith('data:')) {
                 try {
-                  const data = JSON.parse(line.substring(5).trim());
-                  this.options.onEvent(data);
-                } catch (error) {
-                  console.error('Error parsing SSE line:', error);
+                  const jsonData = trimmedLine.substring(5).trim();
+                  if (jsonData && jsonData !== '[DONE]') {
+                    const data: TaskEvent = JSON.parse(jsonData);
+                    this.options.onEvent(data);
+                  }
+                } catch (parseError) {
+                  console.error('Error parsing SSE data:', parseError);
+                  // Don't break the stream for parsing errors
                 }
               }
             }
-            
-            processStream();
-          }).catch(error => {
+          }
+        } catch (error) {
+          if (error.name !== 'AbortError') {
             console.error('Error reading stream:', error);
             this.options.onError('Error reading response stream');
-          });
-        };
-        
-        processStream();
-      })
-      .catch(error => {
-        console.error('Fetch error:', error);
+          }
+        } finally {
+          this.isConnected = false;
+        }
+      };
+
+      await processStream();
+      
+    } catch (error) {
+      this.isConnected = false;
+      
+      if (error.name === 'AbortError') {
+        console.log('Request was aborted');
+        return;
+      }
+
+      console.error('Fetch error:', error);
+      
+      // Handle specific error types
+      if (error.message.includes('Failed to fetch')) {
+        this.options.onError('Unable to connect to server. Please check if the backend is running on localhost:5001');
+      } else if (error.message.includes('HTTP error! status:')) {
+        this.options.onError(`Server error: ${error.message}`);
+      } else {
         this.options.onError(`Connection error: ${error.message}`);
-      });
+      }
+    }
+  }
+
+  public close(): void {
+    this.isConnected = false;
+    
+    if (this.abortController) {
+      this.abortController.abort();
+      this.abortController = null;
+    }
+    
+    if (this.options.onClose) {
+      this.options.onClose();
+    }
+  }
+
+  public isActiveConnection(): boolean {
+    return this.isConnected;
   }
 }
